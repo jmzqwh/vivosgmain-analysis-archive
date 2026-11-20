@@ -367,10 +367,10 @@ IV：`00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F`（`0x7E66258870`）。
 
 | 脚本 | 位置 | 用途 |
 |---|---|---|
-| `sgdump.js` | `C:\Users\Administrator\Desktop\1\sgdump.js` | Frida dump 脚本：等待模块、熵+首字节判定解密、dump 三段、dump 匿名可执行段、`rpc.redump` 重跑 |
-| `sgrun.py` | `C:\Users\Administrator\Desktop\1\sgrun.py` | 驱动脚本：`spawn`/`attach` 目标、连接远程 frida-server（默认 `127.0.0.1:27043`）、等待 `done`、`adb pull` 产物、写 `base.txt`/`meta.json` |
-| `sgverify.py` | `C:\Users\Administrator\Desktop\1\sgverify.py` | 产物校验：seg1 大小、首 4 字节 ≠ `AC0EA365`、窗口熵 <7.0、A64 prologue、匿名段熵 |
-| `ida_apply_dump.py` | `C:\Users\Administrator\Desktop\1\ida_apply_dump.py` | 回填 IDB：重定基到 `0x7E66201000`、patch 三段、修段权限、`del_items`+`auto_wait`、`add_func`+反编译验证 |
+| `sgdump.js` | `C:\Users\Administrator\Desktop\1\sgdump.js` | Frida dump 脚本：等待模块、熵+首字节判定解密、dump 三段、dump 匿名可执行段、`rpc.redump` 重跑（全文见附录 B） |
+| `sgrun.py` | `C:\Users\Administrator\Desktop\1\sgrun.py` | 驱动脚本：`spawn`/`attach` 目标、连接远程 frida-server（默认 `127.0.0.1:27043`）、等待 `done`、`adb pull` 产物、写 `base.txt`/`meta.json`（全文见附录 C） |
+| `sgverify.py` | `C:\Users\Administrator\Desktop\1\sgverify.py` | 产物校验：seg1 大小、首 4 字节 ≠ `AC0EA365`、窗口熵 <7.0、A64 prologue、匿名段熵（全文见附录 D） |
+| `ida_apply_dump.py` | `C:\Users\Administrator\Desktop\1\ida_apply_dump.py` | 回填 IDB：重定基到 `0x7E66201000`、patch 三段、修段权限、`del_items`+`auto_wait`、`add_func`+反编译验证（全文见附录 E） |
 | IDAPython 修复脚本 | 见附录 A | 定义 `JNINativeMethod`、给表应用类型、按 name 重命名 fnPtr、给 fnPtr 建函数 |
 | 产物目录 | `C:\Users\Administrator\Desktop\1\sg_dump` | `base.txt`、`meta.json`、`seg1_code.bin`、`seg2_data.bin`、`seg3_plt.bin`、3 个 anon dump |
 
@@ -519,3 +519,495 @@ for i in range(COUNT):
 ```
 
 已在当前回填 IDB 上验证前两步：表地址 flags 由 `0x9400`（普通字节）变为 `0x6000`（`FF_STRUCT`），反编译中 `&byte_7E66258880` 变为 `&stru_7E66258880`。
+
+---
+
+## 附录 B：`sgdump.js`
+
+用途：设备侧 dump `libvivosgmain.so` 的代码段/数据段/PLT 段与匿名可执行段，内置“首字节 + 熵”解密判定和 `rpc.redump` 重跑入口。
+运行：`frida -U -f <包名> -l sgdump.js --no-pause`，或由 `sgrun.py` 加载；产物写入设备 `/data/local/tmp/sgdump`。
+依赖：Frida 16+（`frida`/`frida-tools`）、已 root 的 Android 设备与 `frida-server`、目标应用会加载 `libvivosgmain.so`。
+
+```javascript
+/*
+ * sgdump.js — libvivosgmain.so 动态 dump
+ * 设计原则：零 Interceptor，只用轮询 + Memory.readByteArray；
+ *          解密判定用「熵 + 首字节」双条件。
+ */
+'use strict';
+
+var CFG = {
+  moduleName: 'libvivosgmain.so',
+  outDir: '/data/local/tmp/sgdump',
+  segs: [
+    { off: 0x00000, size: 0x451E4, name: 'seg1_code.bin' },
+    { off: 0x55B60, size: 0x14078, name: 'seg2_data.bin' },
+    { off: 0x6A078, size: 0x00A5C, name: 'seg3_plt.bin' }
+  ],
+  jniOnLoadOffset: 0x1C33C,
+  cipherHead: [0xAC, 0x0E, 0xA3, 0x65],   // 样本中 JNI_OnLoad 的密文首 4 字节
+  entropyWindow: 0x1000,
+  entropyThreshold: 7.0,                  // 加密≈7.7，解密 5.0~6.2
+  pollIntervalMs: 20,
+  maxWaitModuleMs: 90000,
+  maxWaitDecryptMs: 60000,
+  dumpAnon: true,
+  maxAnonSize: 64 * 1024 * 1024
+};
+
+var T0 = Date.now();
+function ms() { return Date.now() - T0; }
+function log(s) { console.log('[sg +' + (ms() / 1000).toFixed(2) + 's] ' + s); }
+function sleep(t) { return new Promise(function (r) { setTimeout(r, t); }); }
+
+/* 跨段/越界安全读取（未映射区域填零，避免整段读取失败） */
+function readSafe(addr, size) {
+  var out = new Uint8Array(size), off = 0;
+  while (off < size) {
+    var cur = addr.add(off), chunk = 0x1000, r = null;
+    try { r = Process.findRangeByAddress(cur); } catch (e) { r = null; }
+    if (r && r.protection.indexOf('r') !== -1) {
+      var remain = r.size - cur.sub(r.base).toInt32();
+      chunk = Math.min(remain, size - off);
+      if (chunk <= 0) chunk = 0x1000;
+      try { out.set(new Uint8Array(Memory.readByteArray(cur, chunk)), off); }
+      catch (e) { log('read failed @' + cur + ' (' + e + ')'); }
+    } else {
+      log('unmapped @' + cur + ', fill zeros');
+    }
+    off += chunk;
+  }
+  return out;
+}
+
+function entropyOf(u8) {
+  var hist = new Uint32Array(256);
+  for (var i = 0; i < u8.length; i++) hist[u8[i]]++;
+  var n = u8.length, h = 0;
+  for (var k = 0; k < 256; k++) {
+    if (hist[k] > 0) { var p = hist[k] / n; h -= p * Math.log2(p); }
+  }
+  return h;
+}
+
+/* 解密状态判定：首 4 字节不再是密文头 + 熵低于阈值 */
+function probeDecrypt(base) {
+  var ea = base.add(CFG.jniOnLoadOffset);
+  var head = readSafe(ea, 4);
+  var win = readSafe(ea, Math.min(CFG.entropyWindow, 0x4000));
+  var h = entropyOf(win);
+  var sameCipher = head[0] === CFG.cipherHead[0] && head[1] === CFG.cipherHead[1] &&
+                   head[2] === CFG.cipherHead[2] && head[3] === CFG.cipherHead[3];
+  var plausible = !(head[0] === 0 && head[1] === 0) &&
+                  !(head[0] === 0xFF && head[1] === 0xFF && head[2] === 0xFF && head[3] === 0xFF);
+  return {
+    decrypted: !sameCipher && plausible && h < CFG.entropyThreshold,
+    entropy: h,
+    head: Array.prototype.map.call(head, function (b) {
+      return ('0' + b.toString(16)).slice(-2);
+    }).join('')
+  };
+}
+
+function writeFile(name, u8) {
+  var path = CFG.outDir + '/' + name;
+  try {
+    var f = new File(path, 'wb');
+    f.write(u8.buffer); f.flush(); f.close();
+    log('saved ' + path + ' (' + u8.length + ' bytes)');
+    send({ t: 'file', name: name, path: path, size: u8.length });
+    return true;
+  } catch (e) {
+    log('WRITE FAILED ' + path + ': ' + e);
+    send({ t: 'error', msg: 'write failed: ' + e, path: path });
+    return false;
+  }
+}
+
+/* 匿名可执行段（解压产物可能的落点） */
+function anonExecRanges(mod) {
+  var out = [];
+  ['rwx', 'r-x', '--x'].forEach(function (prot) {
+    var rs = [];
+    try { rs = Process.enumerateRanges(prot); } catch (e) { return; }
+    rs.forEach(function (r) {
+      if (r.file) return;                                  // 只保留匿名映射
+      if (r.size < 0x1000 || r.size > CFG.maxAnonSize) return;
+      var overlap = r.base.compare(mod.base) < 0
+        ? (r.base.add(r.size).compare(mod.base) > 0)
+        : (mod.base.add(mod.size).compare(r.base) > 0);
+      if (overlap) return;                                 // 跳过模块自身
+      for (var i = 0; i < out.length; i++) if (out[i].base.equals(r.base)) return;
+      out.push(r);
+    });
+  });
+  return out;
+}
+
+async function waitModule() {
+  log('waiting for module ' + CFG.moduleName);
+  var deadline = Date.now() + CFG.maxWaitModuleMs;
+  while (Date.now() < deadline) {
+    var m = Process.findModuleByName(CFG.moduleName);
+    if (m) {
+      log('module found base=' + m.base + ' size=0x' + m.size.toString(16) + ' path=' + m.path);
+      send({ t: 'module', base: m.base.toString(), size: m.size, path: m.path });
+      return m;
+    }
+    await sleep(CFG.pollIntervalMs);
+  }
+  throw new Error('module not loaded within ' + CFG.maxWaitModuleMs + 'ms');
+}
+
+async function waitDecrypt(base) {
+  log('waiting decryption (expect entropy ~7.7 at first, then <' + CFG.entropyThreshold + ')');
+  var deadline = Date.now() + CFG.maxWaitDecryptMs, lastLog = 0;
+  while (Date.now() < deadline) {
+    var st = probeDecrypt(base);
+    if (Date.now() - lastLog > 1000) {
+      lastLog = Date.now();
+      log('  probe: head=' + st.head + ' entropy=' + st.entropy.toFixed(2) +
+          ' decrypted=' + st.decrypted);
+    }
+    if (st.decrypted) return st;
+    await sleep(100);
+  }
+  var last = probeDecrypt(base);
+  log('DECRYPT TIMEOUT: head=' + last.head + ' entropy=' + last.entropy.toFixed(2));
+  return last;
+}
+
+async function main() {
+  log('start; pid=' + Process.id + ' arch=' + Process.arch);
+  var mod = await waitModule();
+  var base = mod.base;
+  var st = await waitDecrypt(base);
+
+  log('[3/6] dumping fixed segments');
+  var written = [];
+  for (var i = 0; i < CFG.segs.length; i++) {
+    var s = CFG.segs[i];
+    if (writeFile(s.name, readSafe(base.add(s.off), s.size))) written.push(s.name);
+  }
+
+  if (CFG.dumpAnon) {
+    var rs = anonExecRanges(mod);
+    log('[4/6] anonymous exec ranges: ' + rs.length);
+    for (var j = 0; j < rs.length; j++) {
+      var r = rs[j];
+      var nm = 'anon_' + r.base.toString().replace(/^0x/, '') + '_' + r.size + '.bin';
+      log('  range ' + r.base + ' size=0x' + r.size.toString(16) + ' prot=' + r.protection);
+      if (writeFile(nm, readSafe(r.base, r.size))) written.push(nm);
+    }
+  }
+
+  log('[5/6] files=' + written.length + ' decrypted=' + st.decrypted);
+  send({ t: 'done', base: base.toString(), size: mod.size, decrypted: st.decrypted,
+         entropy: st.entropy, head: st.head, files: written });
+  log('[6/6] DONE');
+}
+
+/* 允许驱动重跑 dump，不需要重启进程 */
+rpc.exports = {
+  redump: function () {
+    try {
+      var m = Process.findModuleByName(CFG.moduleName);
+      if (!m) return 'module not found';
+      var st = probeDecrypt(m.base), out = [];
+      for (var i = 0; i < CFG.segs.length; i++) {
+        var s = CFG.segs[i];
+        if (writeFile(s.name, readSafe(m.base.add(s.off), s.size))) out.push(s.name);
+      }
+      return JSON.stringify({ decrypted: st.decrypted, entropy: st.entropy, files: out });
+    } catch (e) { return 'error: ' + e; }
+  }
+};
+
+main().catch(function (e) {
+  log('FATAL: ' + e);
+  send({ t: 'fatal', msg: String(e) });
+});
+```
+
+---
+
+## 附录 C：`sgrun.py`
+
+用途：驱动 `sgdump.js`——准备设备目录、连接远程 `frida-server`、`spawn`/`attach` 目标、等待 `done`、`adb pull` 产物并写 `base.txt`/`meta.json`。
+运行：`python sgrun.py --pkg com.xxx --remote 127.0.0.1:27043 --out sg_dump`；或 `python sgrun.py --pkg com.xxx --serial <sn> --attach`。
+依赖：Python 3.13（已用 3.13.9 通过 `py_compile`）、`pip install frida`、`adb`、设备端 `frida-server`（默认端口 27043，可用 `adb forward` 转发）。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sgrun.py — 驱动 sgdump.js：spawn 目标、加载脚本、等待 done、adb pull 产物
+用法:
+  python sgrun.py --pkg com.xxx --remote 127.0.0.1:27043 --out sg_dump
+  python sgrun.py --pkg com.xxx --serial <sn> --attach
+"""
+import argparse, json, os, subprocess, sys, threading
+import frida
+
+DEV_DIR = '/data/local/tmp/sgdump'
+
+def sh(cmd, quiet=False):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if r.returncode != 0 and not quiet:
+        print('[adb][err] %s\n         %s' % (cmd, (r.stderr or r.stdout).strip()))
+    return (r.stdout or '').strip()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--pkg', required=True)
+    ap.add_argument('--serial', default=None)
+    ap.add_argument('--remote', default='127.0.0.1:27043')
+    ap.add_argument('--script', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sgdump.js'))
+    ap.add_argument('--out', default='sg_dump')
+    ap.add_argument('--timeout', type=int, default=150)
+    ap.add_argument('--attach', action='store_true', help='attach 到已运行进程，不 spawn')
+    args = ap.parse_args()
+
+    adb = 'adb' + (' -s %s' % args.serial if args.serial else '')
+    if not os.path.isfile(args.script):
+        print('[x] 找不到脚本: %s' % args.script); return 2
+    src = open(args.script, 'r', encoding='utf-8').read()
+    os.makedirs(args.out, exist_ok=True)
+
+    # frida 的 File API 只能写文件不能建目录，这里先准备好
+    sh("%s shell \"sbin/magisk su -c 'rm -rf %s; mkdir -p %s; chmod 777 %s'\"" % (adb, DEV_DIR, DEV_DIR, DEV_DIR))
+
+    host, port = args.remote.split(':')
+    sh('%s forward tcp:%s tcp:%s' % (adb, port, port))
+    try:
+        dev = frida.get_device_manager().add_remote_device(args.remote)
+        dev.enumerate_processes()
+    except Exception as e:
+        print('[x] 连接 frida-server 失败: %s' % e)
+        print('    检查: ps -A | grep fs ; adb forward --list ; 端口是否被占用')
+        return 3
+
+    if args.attach:
+        proc = next((p for p in dev.enumerate_processes() if p.name == args.pkg), None)
+        if proc is None:
+            print('[x] 未找到运行中的进程 %s' % args.pkg); return 4
+        pid = proc.pid
+        session = dev.attach(pid)
+        print('[+] attached pid=%d' % pid)
+    else:
+        pid = dev.spawn([args.pkg])
+        session = dev.attach(pid)
+        print('[+] spawned pid=%d (已挂起，脚本加载后再 resume)' % pid)
+
+    state = {'done': None, 'base': None, 'fatal': None, 'files': []}
+    done_evt = threading.Event()
+
+    def on_message(msg, data):
+        if msg.get('type') == 'log':
+            print(msg['payload']); return
+        if msg.get('type') == 'error':
+            print('[script error] %s' % msg.get('stack', msg.get('description'))); return
+        p = msg.get('payload') or {}
+        t = p.get('t')
+        if t == 'module':
+            state['base'] = p['base']; print('[driver] module base = %s' % p['base'])
+        elif t == 'file':
+            state['files'].append(p['name'])
+        elif t == 'done':
+            state['done'] = p; done_evt.set()
+        elif t == 'fatal':
+            state['fatal'] = p.get('msg'); done_evt.set()
+        elif t == 'error':
+            print('[driver] script error: %s' % p)
+
+    def on_detached(reason, crash=None):
+        print('[!] session detached: reason=%s crash=%s' % (reason, crash))
+        if reason == 'process-terminated':
+            print('    → 进程已退出：优先怀疑反注入检测，或目标自身崩溃')
+        done_evt.set()
+
+    session.on('detached', on_detached)
+    script = session.create_script(src)
+    script.on('message', on_message)
+    script.load()
+    if not args.attach:
+        dev.resume(pid)
+        print('[+] resumed pid=%d' % pid)
+
+    if not done_evt.wait(args.timeout):
+        print('[x] 超时 %ds 未拿到 done，现场诊断：' % args.timeout)
+        print(sh('%s shell "sbin/magisk su -c \'cat /proc/%d/maps | grep -i vivosg\'"' % (adb, pid)))
+        print(sh("%s logcat -d -t 80 | grep -iE 'vivo|sg|frida|DEBUG'" % adb))
+        return 5
+    if state['fatal']:
+        print('[x] 脚本失败: %s' % state['fatal']); return 6
+
+    d = state['done'] or {}
+    print('[+] done: base=%s decrypted=%s entropy=%.2f head=%s' %
+          (d.get('base'), d.get('decrypted'), d.get('entropy', 0), d.get('head')))
+
+    sh('%s pull %s/. %s' % (adb, DEV_DIR, args.out))
+    if state['base']:
+        open(os.path.join(args.out, 'base.txt'), 'w').write(state['base'] + '\n')
+    json.dump(d, open(os.path.join(args.out, 'meta.json'), 'w', encoding='utf-8'),
+              ensure_ascii=False, indent=2)
+    print('[+] 产物目录: %s' % os.path.abspath(args.out))
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+---
+
+## 附录 D：`sgverify.py`
+
+用途：校验 dump 产物是否已解密、大小是否正确、A64 prologue 是否合理，并打印匿名段熵。
+运行：`python sgverify.py sg_dump`（默认目录 `sg_dump`）；退出码 0=PASS，1=FAIL。
+依赖：Python 3.13 标准库（`math/os/struct/sys`），无第三方包。
+
+```python
+#!/usr/bin/env python3
+import math, os, struct, sys
+
+CIPHER = bytes([0xAC, 0x0E, 0xA3, 0x65])
+JNI_OFF = 0x1C33C
+
+def entropy(b):
+    if not b: return 0.0
+    c = {}
+    for x in b: c[x] = c.get(x, 0) + 1
+    n = float(len(b))
+    return -sum((v / n) * math.log2(v / n) for v in c.values())
+
+d = sys.argv[1] if len(sys.argv) > 1 else 'sg_dump'
+p = os.path.join(d, 'seg1_code.bin')
+if not os.path.isfile(p):
+    print('[x] 缺少 %s' % p); sys.exit(2)
+
+data = open(p, 'rb').read()
+win  = data[JNI_OFF:JNI_OFF + 0x1000]
+head = data[JNI_OFF:JNI_OFF + 4]
+h    = entropy(win)
+prologue = head[0] in (0xFD, 0xFF) or (head[1] & 0x03) in (0x01, 0x03)
+
+print('[*] seg1 size=%d (期望 %d)' % (len(data), 0x451E4))
+print('    head=%s entropy=%.2f prologue=%s' % (head.hex(), h, prologue))
+print('    words=%s' % [hex(w) for w in struct.unpack_from('<8I', data, JNI_OFF)])
+
+ok = head != CIPHER and h < 7.0 and prologue
+print('[%s] %s' % ('PASS' if ok else 'FAIL',
+                   '可以回填 IDA' if ok else '仍是密文，按第五节排错'))
+
+for name in sorted(os.listdir(d)):
+    if name.startswith('anon_') and name.endswith('.bin'):
+        b = open(os.path.join(d, name), 'rb').read()
+        print('[anon] %-38s size=%-8d entropy=%.2f' % (name, len(b), entropy(b[:0x4000])))
+sys.exit(0 if ok else 1)
+```
+
+---
+
+## 附录 E：`ida_apply_dump.py`
+
+用途：把 dump 产物回填到 `libvivosgmain.so.i64`——重定基、写入三段、修段权限、重分析、`add_func` 并反编译验证 `JNI_OnLoad`。
+运行：IDA 中 `File → Script file…` 选择本脚本；或 `idat -A -S"ida_apply_dump.py" libvivosgmain.so.i64`。
+依赖：IDA Pro 9.x + IDAPython（Python 3.13）。已修复 `if` 缺冒号的语法问题，并改用 IDA 9.4 实际存在的 API：`ida_segment.add_segm`（原 `create_segment` 不存在）、`idc.set_segm_attr`（原 `ida_segment.set_segm_attr` 不存在）、权限常量改用 `ida_segment.SEGPERM_*`；已用 Python 3.13.9 `py_compile` 通过。
+
+```python
+# -*- coding: utf-8 -*-
+from __future__ import print_function
+
+import os
+
+import idaapi
+import ida_bytes
+import ida_segment
+import ida_auto
+import ida_funcs
+import ida_hexrays
+import idc
+
+DUMP_DIR = r'C:\Users\Administrator\Desktop\1\sg_dump'      # 改成你的产物目录
+
+JNI_OFF = 0x1C33C
+
+SEGS = [
+    (0x00000, 'seg1_code.bin', 0x451E4, True),
+    (0x55B60, 'seg2_data.bin', 0x14078, False),
+    (0x6A078, 'seg3_plt.bin',  0x00A5C, True),
+]
+
+# 1) 读运行时基址
+base_file = os.path.join(DUMP_DIR, 'base.txt')
+if not os.path.isfile(base_file):
+    print('[x] 缺少 base.txt: %s' % base_file)
+else:
+    with open(base_file, 'r') as f:
+        BASE = int(f.read().strip(), 16)
+
+    print('[+] runtime base = 0x%X' % BASE)
+
+    # 2) 重定基
+    cur = idaapi.get_imagebase()
+    if cur != BASE:
+        ida_segment.rebase_program(BASE - cur, 0)
+
+    if idaapi.get_imagebase() != BASE:
+        print('[x] rebase 失败，当前 imagebase = 0x%X' % idaapi.get_imagebase())
+    else:
+        print('[+] imagebase ok = 0x%X' % idaapi.get_imagebase())
+
+        # 3) 逐段写回
+        i = 0
+        while i < len(SEGS):
+            off = SEGS[i][0]
+            fn = SEGS[i][1]
+            size = SEGS[i][2]
+            is_code = SEGS[i][3]
+            i = i + 1
+
+            path = os.path.join(DUMP_DIR, fn)
+            if not os.path.isfile(path):
+                print('[-] 跳过缺失文件 %s' % fn)
+                continue
+
+            with open(path, 'rb') as fh:
+                data = fh.read()[:size]
+
+            ea = BASE + off
+            seg = ida_segment.getseg(ea)
+            if seg is None:
+                cls = 'CODE' if is_code else 'DATA'
+                ida_segment.add_segm(0, ea, ea + size, 'LOAD', cls)
+                seg = ida_segment.getseg(ea)
+
+            ida_bytes.patch_bytes(ea, data)
+            print('[+] patched %s -> 0x%X (%d bytes)' % (fn, ea, len(data)))
+
+            # 4) 同段修权限
+            if seg is not None:
+                if is_code:
+                    perm = ida_segment.SEGPERM_READ | ida_segment.SEGPERM_EXEC
+                else:
+                    perm = ida_segment.SEGPERM_READ | ida_segment.SEGPERM_WRITE
+                idc.set_segm_attr(seg.start_ea, idc.SEGATTR_PERM, perm)
+                print('[+] %s perm -> %d' % (fn, perm))
+
+        # 5) 重新分析
+        ida_bytes.del_items(BASE + JNI_OFF, ida_bytes.DELIT_SIMPLE, 4)
+        ida_auto.auto_wait()
+
+        # 6) 验证
+        EA = BASE + JNI_OFF
+        print('[+] JNI_OnLoad head = %s' % ida_bytes.get_bytes(EA, 16).hex())
+        if ida_funcs.add_func(EA, EA + 0x400):
+            try:
+                code = ida_hexrays.decompile(EA)
+                print('[+] pseudocode:')
+                print(str(code)[:800])
+            except Exception as e:
+                print('[-] decompile error: %s' % e)
+        else:
+            print('[-] add_func 失败，检查段权限是否已改为可执行')
+```
